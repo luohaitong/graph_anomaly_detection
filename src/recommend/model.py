@@ -61,7 +61,7 @@ class BasePUP(nn.Module):
         self.gc = gc
     
     def forward(self, feature, adj, user, item_p, item_n, cat_p, cat_n, price_p, price_n):
-
+        #feature和adj都是num_nodes*num*nodes的矩阵，feature为对角线上为1的单矩阵，adj为对称的邻接矩阵
         x = self.encode(feature, adj)
         pred_p, pred_n = self.decode(x, user, item_p, item_n, cat_p, cat_n, price_p, price_n)
 

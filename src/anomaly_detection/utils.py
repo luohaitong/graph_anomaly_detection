@@ -20,6 +20,7 @@ from visdom import Visdom
 import config.const as const_util
 import data
 import recommender
+import pandas as pd
 
 
 class ContextManager(object):
@@ -44,6 +45,8 @@ class ContextManager(object):
             return recommender.PUPMinusCPRecommender(flags_obj, workspace, cm)
         elif flags_obj.model =='PUPRANK':
             return recommender.PUPRankRecommender(flags_obj, workspace, cm)
+        elif flags_obj.model =='IEAD':
+            return recommender.IEADDetector(flags_obj, workspace, cm)
     
     def set_device(self, flags_obj):
 
@@ -75,7 +78,7 @@ class ContextManager(object):
     
     def set_process_name(self):
 
-        setproctitle.setproctitle(self.name + '@zhengyu')
+        setproctitle.setproctitle(self.name + '@luohaitong')
     
     def set_logging(self):
 
@@ -161,36 +164,32 @@ class ResourceManager(object):
         self.datafile_prefix = flags_obj.datafile_prefix
         self.all_items = np.arange(flags_obj.num_items, dtype=np.int32)
         self.load_positive_sample(flags_obj)
+        self.load_features(flags_obj)
         self.load_cats(flags_obj)
-        self.load_prices(flags_obj)
+        self.load_PA(flags_obj)
         self.num_workers = flags_obj.num_workers
         self.num_users = flags_obj.num_users
         self.topk = flags_obj.topk
     
     def load_positive_sample(self, flags_obj):
 
-        with open(os.path.join(flags_obj.datafile_prefix, const_util.test_positive)) as f:
+        with open(os.path.join(flags_obj.datafile_prefix, const_util.edge_index)) as f:
 
-            self.test_positive = json.loads(f.read())
-        
-        with open(os.path.join(flags_obj.datafile_prefix, const_util.positive)) as f:
+            self.flow_adj = json.loads(f.read())
 
-            self.positive = json.loads(f.read())
-    
+    def load_features(self, flags_obj):
+
+        self.features = np.load(os.path.join(flags_obj.datafile_prefix, const_util.features))
+
     def load_cats(self, flags_obj):
 
         self.cats = np.load(os.path.join(flags_obj.datafile_prefix, const_util.cats))
     
-    def load_prices(self, flags_obj):
+    def load_PA(self, flags_obj):
 
-        if flags_obj.dataset == 'yelp':
-            self.prices = np.load(os.path.join(flags_obj.datafile_prefix, const_util.prices))
-        elif flags_obj.dataset == 'beibei':
-            if flags_obj.model != 'PUPRANK':
-                self.prices = np.load(os.path.join(flags_obj.datafile_prefix, str(flags_obj.num_prices) + '_' + const_util.prices))
-            else:
-                self.prices = np.load(os.path.join(flags_obj.datafile_prefix, str(flags_obj.num_prices) + '_rank_' + const_util.prices))
-    
+        self.PA_level = np.load(os.path.join(flags_obj.datafile_prefix, const_util.PA_level))
+
+
     def get_test_dataloader(self):
 
         return DataLoader(data.TestDataset(self), batch_size=1, shuffle=False, num_workers=self.num_workers, drop_last=False)
@@ -200,12 +199,14 @@ class BaseGraphManager(object):
 
     def __init__(self, flags_obj):
 
-        self.num_nodes = flags_obj.num_users + flags_obj.num_items + flags_obj.num_cats + flags_obj.num_prices
+        self.num_items = flags_obj.num_items
+        self.num_cats = flags_obj.num_cats
+        self.num_PA = flags_obj.num_PA
     
     def transfer_data(self, device):
 
         self.feature = self.feature.to(device)
-        self.adj = self.adj.to(device)
+        self.flow_char_adj = self.flow_char_adj.to(device)
     
     def generate_id_feature(self):
 
@@ -214,65 +215,48 @@ class BaseGraphManager(object):
         v = torch.ones(self.num_nodes)
         #生成的矩阵为对角矩阵
         self.feature = torch.sparse.FloatTensor(i, v, torch.Size([self.num_nodes, self.num_nodes]))
+
     
-    def generate_adj(self, flags_obj):
+    def generate_feature_and_adj(self, flags_obj):
 
-        train_positive, item_cat, item_index, cat_index, item_lux = self.load_data(flags_obj)
+        features, train_edge_index, PA_index, cat_index = self.load_data(flags_obj)
 
-        row, col = self.generate_coo_row_col(flags_obj, train_positive, item_cat, item_index, cat_index, item_lux)
+        flow_char_row, flow_char_col = self.generate_coo_row_col(flags_obj, train_edge_index, PA_index, cat_index)
 
-        self.generate_adj_from_coo_row_col(row, col)
+        self.feature = features
+        self.flow_adj = train_edge_index
+        self.flow_char_adj = self.generate_adj_from_coo_row_col(flow_char_row, flow_char_col, is_flow_adj=False)
     
     def load_data(self, flags_obj):
 
-        with open(os.path.join(flags_obj.datafile_prefix, const_util.train_positive), 'r') as f:
-            train_positive = json.loads(f.read())
-        with open(os.path.join(flags_obj.datafile_prefix, const_util.item_cat), 'r') as f:
-            item_cat = json.loads(f.read())
-        with open(os.path.join(flags_obj.datafile_prefix, const_util.item_index), 'r') as f:
-            item_index = json.loads(f.read())
+        features = torch.load(os.path.join(flags_obj.datafile_prefix, const_util.features))
         with open(os.path.join(flags_obj.datafile_prefix, const_util.cat_index), 'r') as f:
             cat_index = json.loads(f.read())
-        with open(os.path.join(flags_obj.datafile_prefix, const_util.item_lux), 'r') as f:
-            item_lux = json.loads(f.read())
-        
-        return train_positive, item_cat, item_index, cat_index, item_lux
-    
-    def generate_coo_row_col(self, flags_obj, train_positive, item_cat, item_index, cat_index, item_lux):
+        with open(os.path.join(flags_obj.datafile_prefix, const_util.PA_index), 'r') as f:
+            PA_index = json.loads(f.read())
+        train_edge_index = np.load(os.path.join(flags_obj.datafile_prefix, const_util.train_data, const_util.train_edge_index),
+                                   allow_pickle=True).item()
 
-        count = 0
-        for user, item in train_positive.items():
-            count = count + len(item)
-        count = count + 2 * flags_obj.num_items
+        return features, train_edge_index, PA_index, cat_index
+    
+    def generate_coo_row_col(self, flags_obj, train_edge_index, cat_index, PA_index):
+
         #前count个数，row为user、col为对应的评分item;后2*num_items个数，每两个一组，第一个row为item、col为类别id；第二个row为item、col为价格id
-        row = np.zeros(count, dtype=np.int32)
-        col = np.zeros(count, dtype=np.int32)
+        flow_char_row = np.zeros(2 * flags_obj.num_items, dtype=np.int32)
+        flow_char_col = np.zeros(2 * flags_obj.num_items, dtype=np.int32)
+
         cursor = 0
-        for user, item in train_positive.items():
-            row[cursor: cursor + len(item)] = int(user)
-            col[cursor: cursor + len(item)] = np.array(item) + flags_obj.num_users
-            cursor = cursor + len(item)
-
-        for item_id, cat_id in item_cat.items():
-            r = item_index[item_id] + flags_obj.num_users
-            c1 = cat_index[cat_id] + flags_obj.num_users + flags_obj.num_items
-            if flags_obj.dataset == 'beibei':
-                num_prices = flags_obj.num_prices
-                lux = int(item_lux[item_id] * num_prices)
-                if lux >= num_prices:
-                    lux = num_prices - 1
-            elif flags_obj.dataset == 'yelp':
-                lux = int(item_lux[item_id]) - 1
-            c2 = flags_obj.num_users + flags_obj.num_items + flags_obj.num_cats + lux
-
-            row[cursor: cursor + 2] = r
-            col[cursor] = c1
-            col[cursor + 1] = c2
-            cursor = cursor + 2
+        for item_id in cat_index:
+            c1 = cat_index[item_id]
+            c2 = PA_index[item_id] + flags_obj.num_cats
+            flow_char_col[cursor: cursor + 2 ] = item_id
+            flow_char_row[cursor] = c1
+            flow_char_row[cursor + 1] = c2
+            cursor += 2
         
-        return row, col
+        return flow_char_row, flow_char_col
     
-    def gennerate_adj_from_coo_row_col(self, row, col):
+    def gennerate_adj_from_coo_row_col(self, row, col, is_flow_adj):
 
         pass
 
@@ -283,15 +267,30 @@ class GraphManager(BaseGraphManager):
 
         super(GraphManager, self).__init__(flags_obj)
     
-    def generate_adj_from_coo_row_col(self, row, col):
+    def generate_adj_from_coo_row_col(self, row, col, is_flow_adj):
 
-        adj = sp.coo_matrix((np.ones(len(row)), (row, col)), shape=(self.num_nodes, self.num_nodes), dtype=np.float32)
-        #将矩阵转为对称矩阵
-        adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
-        adj = self.normalize(adj + sp.eye(adj.shape[0]))
+        if is_flow_adj:
+            adj = sp.coo_matrix((np.ones(len(row)), (row, col)), shape=(self.num_items, self.num_items), dtype=np.float32)
+            #将矩阵转为对称矩阵
+            adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
+            #adj = self.normalize(adj + sp.eye(adj.shape[0]))
+            adj = self.normalize(adj)
+        else:
+            adj = sp.coo_matrix((np.ones(len(row)), (row, col)),
+                                shape=(self.num_cats + self.num_PA, self.num_items), dtype=np.float32)
+            # adj = self.normalize(adj + sp.eye(adj.shape[0]))
+            adj = self.normalize(adj)
+        adj = self.sparse_mx_to_torch_sparse_tensor(adj)
+        return adj
+
+    def generate_flow_char_adj_from_coo_row_col(self, row, col):
+
+        adj = sp.coo_matrix((np.ones(len(row)), (row, col)), shape=(self.num_cats+ self.num_PA, 2 * self.num_items), dtype=np.float32)
+        #adj = self.normalize(adj + sp.eye(adj.shape[0]))
+        adj = self.normalize(adj)
         adj = self.sparse_mx_to_torch_sparse_tensor(adj)
 
-        self.adj = adj
+        self.flow_char_adj = adj
     
     def normalize(self, mx):
         """Row-normalize sparse matrix"""
@@ -309,83 +308,4 @@ class GraphManager(BaseGraphManager):
         values = torch.from_numpy(sparse_mx.data)
         shape = torch.Size(sparse_mx.shape)
         return torch.sparse.FloatTensor(indices, values, shape)
-
-
-class RankGraphManager(GraphManager):
-
-    def __init__(self, flags_obj):
-
-        super(RankGraphManager, self).__init__(flags_obj)
-    
-    def load_data(self, flags_obj):
-
-        with open(os.path.join(flags_obj.datafile_prefix, const_util.train_positive), 'r') as f:
-            train_positive = json.loads(f.read())
-        with open(os.path.join(flags_obj.datafile_prefix, const_util.item_cat), 'r') as f:
-            item_cat = json.loads(f.read())
-        with open(os.path.join(flags_obj.datafile_prefix, const_util.item_index), 'r') as f:
-            item_index = json.loads(f.read())
-        with open(os.path.join(flags_obj.datafile_prefix, const_util.cat_index), 'r') as f:
-            cat_index = json.loads(f.read())
-        with open(os.path.join(flags_obj.datafile_prefix, const_util.item_lux_rank), 'r') as f:
-            item_lux = json.loads(f.read())
-        
-        return train_positive, item_cat, item_index, cat_index, item_lux
-
-
-class MinusGraphManager(GraphManager):
-
-    def __init__(self, flags_obj):
-
-        super(MinusGraphManager, self).__init__(flags_obj)
-        self.correct_num_nodes(flags_obj)
-    
-    def correct_num_nodes(self, flags_obj):
-
-        if flags_obj.model == 'PUP-C':
-            self.num_nodes = self.num_nodes - flags_obj.num_cats
-        elif flags_obj.model == 'PUP-P':
-            self.num_nodes = self.num_nodes - flags_obj.num_prices
-        elif flags_obj.model == 'PUP-CP':
-            self.num_nodes = self.num_nodes - flags_obj.num_cats - flags_obj.num_prices
-    
-    def generate_coo_row_col(self, flags_obj, train_positive, item_cat, item_index, cat_index, item_lux):
-
-        count = 0
-        for user, item in train_positive.items():
-            count = count + len(item)
-        count = count + 2 * flags_obj.num_items
-        if flags_obj.model == 'PUP-C' or flags_obj.model == 'PUP-P':
-            count = count - flags_obj.num_items
-        elif flags_obj.model == 'PUP-CP':
-            count = count - 2 * flags_obj.num_items
-        row = np.zeros(count, dtype=np.int32)
-        col = np.zeros(count, dtype=np.int32)
-        cursor = 0
-        for user, item in train_positive.items():
-            row[cursor: cursor + len(item)] = int(user)
-            col[cursor: cursor + len(item)] = np.array(item) + flags_obj.num_users
-            cursor = cursor + len(item)
-        
-        if flags_obj.model == 'PUP-CP':
-            return row, col
-
-        for item_id, cat_id in item_cat.items():
-            r = item_index[item_id] + flags_obj.num_users
-            if flags_obj.dataset == 'beibei':
-                num_prices = flags_obj.num_prices
-                lux = int(item_lux[item_id] * num_prices)
-                if lux == num_prices:
-                    lux = num_prices - 1
-            elif flags_obj.dataseet == 'yelp':
-                lux = int(item_lux[item_id]) - 1
-
-            row[cursor] = r
-            if flags_obj.model == 'PUP-C':
-                col[cursor] = flags_obj.num_users + flags_obj.num_items + lux
-            elif flags_obj.model == 'PUP-P':                
-                col[cursor] = flags_obj.num_users + flags_obj.num_items + cat_index[cat_id]
-            cursor = cursor + 1
-        
-        return row, col
     
