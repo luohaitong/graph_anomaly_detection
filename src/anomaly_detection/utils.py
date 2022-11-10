@@ -161,52 +161,55 @@ class ResourceManager(object):
     def __init__(self, flags_obj):
 
         self.name = flags_obj.name
-        self.datafile_prefix = flags_obj.datafile_prefix
+        self.datafile_prefix = flags_obj.testfile_prefix
         self.all_items = np.arange(flags_obj.num_items, dtype=np.int32)
-        self.load_positive_sample(flags_obj)
-        self.load_features(flags_obj)
+        self.load_items(flags_obj)
         self.load_cats(flags_obj)
         self.load_PA(flags_obj)
+        self.load_features(flags_obj)
         self.num_workers = flags_obj.num_workers
-        self.num_users = flags_obj.num_users
         self.topk = flags_obj.topk
-    
-    def load_positive_sample(self, flags_obj):
 
-        with open(os.path.join(flags_obj.datafile_prefix, const_util.edge_index)) as f:
+    def load_items(self, flags_obj):
 
-            self.flow_adj = json.loads(f.read())
+        self.item_id = torch.load(os.path.join(flags_obj.testfile_prefix, const_util.item_id))
 
     def load_features(self, flags_obj):
 
-        self.features = np.load(os.path.join(flags_obj.datafile_prefix, const_util.features))
+        self.features = torch.load(os.path.join(flags_obj.testfile_prefix, const_util.features))
 
     def load_cats(self, flags_obj):
 
-        self.cats = np.load(os.path.join(flags_obj.datafile_prefix, const_util.cats))
+        self.cats = torch.load(os.path.join(flags_obj.testfile_prefix, const_util.cats))
     
     def load_PA(self, flags_obj):
 
-        self.PA_level = np.load(os.path.join(flags_obj.datafile_prefix, const_util.PA_level))
-
+        self.PA_level = torch.load(os.path.join(flags_obj.testfile_prefix, const_util.PA_level))
 
     def get_test_dataloader(self):
 
-        return DataLoader(data.TestDataset(self), batch_size=1, shuffle=False, num_workers=self.num_workers, drop_last=False)
+        return DataLoader(data.TestDataset(self), batch_size=1024, shuffle=False, num_workers=self.num_workers, drop_last=False)
 
 
 class BaseGraphManager(object):
 
-    def __init__(self, flags_obj):
+    def __init__(self, flags_obj, training = True):
 
-        self.num_items = flags_obj.num_items
+        self.num_items_col = flags_obj.num_items
         self.num_cats = flags_obj.num_cats
         self.num_PA = flags_obj.num_PA
+        self.training = training
+        if self.training:
+            self.num_items_row = flags_obj.num_items
+        else:
+            self.num_items_row = flags_obj.test_num_items
     
     def transfer_data(self, device):
 
-        self.feature = self.feature.to(device)
-        self.flow_char_adj = self.flow_char_adj.to(device)
+        self.flow_adj = self.flow_adj.to(device)
+        if self.training:
+            self.feature = self.feature.to(device)
+            self.flow_char_adj = self.flow_char_adj.to(device)
     
     def generate_id_feature(self):
 
@@ -216,30 +219,65 @@ class BaseGraphManager(object):
         #生成的矩阵为对角矩阵
         self.feature = torch.sparse.FloatTensor(i, v, torch.Size([self.num_nodes, self.num_nodes]))
 
-    
     def generate_feature_and_adj(self, flags_obj):
 
-        features, train_edge_index, PA_index, cat_index = self.load_data(flags_obj)
+        if self.training:
+            edge_index, PA_index, cat_index = self.load_index(flags_obj)
+            features = self.load_features(flags_obj)
+            self.feature = features
 
-        flow_char_row, flow_char_col = self.generate_coo_row_col(flags_obj, train_edge_index, PA_index, cat_index)
+            flow_row, flow_col = self.generate_flow_coo_row_col(edge_index)
+            self.flow_adj = self.generate_adj_from_coo_row_col(flow_row, flow_col, is_flow_adj=True)
+            flow_char_row, flow_char_col = self.generate_char_coo_row_col(flags_obj, PA_index, cat_index)
 
-        self.feature = features
-        self.flow_adj = train_edge_index
-        self.flow_char_adj = self.generate_adj_from_coo_row_col(flow_char_row, flow_char_col, is_flow_adj=False)
-    
-    def load_data(self, flags_obj):
+            self.flow_char_adj = self.generate_adj_from_coo_row_col(flow_char_row, flow_char_col, is_flow_adj=False)
 
-        features = torch.load(os.path.join(flags_obj.datafile_prefix, const_util.features))
-        with open(os.path.join(flags_obj.datafile_prefix, const_util.cat_index), 'r') as f:
-            cat_index = json.loads(f.read())
-        with open(os.path.join(flags_obj.datafile_prefix, const_util.PA_index), 'r') as f:
-            PA_index = json.loads(f.read())
-        train_edge_index = np.load(os.path.join(flags_obj.datafile_prefix, const_util.train_data, const_util.train_edge_index),
-                                   allow_pickle=True).item()
+        else:
+            edge_index = self.load_index(flags_obj)
+            flow_row, flow_col = self.generate_flow_coo_row_col(edge_index)
+            self.flow_adj = self.generate_adj_from_coo_row_col(flow_row, flow_col, is_flow_adj=True)
 
-        return features, train_edge_index, PA_index, cat_index
-    
-    def generate_coo_row_col(self, flags_obj, train_edge_index, cat_index, PA_index):
+
+    def load_features(self, flags_obj):
+
+        features = torch.load(os.path.join(flags_obj.trainfile_prefix, const_util.features))
+
+        return features
+
+    def load_index(self, flags_obj):
+
+        if self.training:
+            with open(flags_obj.datafile_prefix + 'train_' +const_util.cat_index, 'r') as f:
+                cat_index = json.loads(f.read())
+            with open(flags_obj.datafile_prefix + 'train_' + const_util.PA_index, 'r') as f:
+                PA_index = json.loads(f.read())
+            with open(flags_obj.datafile_prefix + 'train_' + const_util.edge_index, 'r') as f:
+                edge_index = json.loads(f.read())['edge_index']
+
+            return edge_index, PA_index, cat_index
+        else:
+            with open(flags_obj.datafile_prefix + 'test_' + const_util.edge_index, 'r') as f:
+                edge_index = json.loads(f.read())['edge_index']
+
+            return edge_index
+
+
+
+    def generate_flow_coo_row_col(self, edge_index):
+
+        # 前count个数，row为user、col为对应的评分item;后2*num_items个数，每两个一组，第一个row为item、col为类别id；第二个row为item、col为价格id
+        flow_row = np.zeros(len(edge_index), dtype=np.int32)
+        flow_col = np.zeros(len(edge_index), dtype=np.int32)
+
+        cursor = 0
+        for pair in edge_index:
+            flow_row[cursor] = pair[0]
+            flow_col[cursor] = pair[1]
+            cursor += 1
+
+        return flow_row, flow_col
+
+    def generate_char_coo_row_col(self, flags_obj, PA_index, cat_index):
 
         #前count个数，row为user、col为对应的评分item;后2*num_items个数，每两个一组，第一个row为item、col为类别id；第二个row为item、col为价格id
         flow_char_row = np.zeros(2 * flags_obj.num_items, dtype=np.int32)
@@ -253,7 +291,7 @@ class BaseGraphManager(object):
             flow_char_row[cursor] = c1
             flow_char_row[cursor + 1] = c2
             cursor += 2
-        
+
         return flow_char_row, flow_char_col
     
     def gennerate_adj_from_coo_row_col(self, row, col, is_flow_adj):
@@ -263,34 +301,26 @@ class BaseGraphManager(object):
 
 class GraphManager(BaseGraphManager):
 
-    def __init__(self, flags_obj):
+    def __init__(self, flags_obj, training = True):
 
-        super(GraphManager, self).__init__(flags_obj)
+        super(GraphManager, self).__init__(flags_obj, training)
     
     def generate_adj_from_coo_row_col(self, row, col, is_flow_adj):
 
         if is_flow_adj:
-            adj = sp.coo_matrix((np.ones(len(row)), (row, col)), shape=(self.num_items, self.num_items), dtype=np.float32)
+            adj = sp.coo_matrix((np.ones(len(row)), (row, col)), shape=(self.num_items_row, self.num_items_col), dtype=np.float32)
             #将矩阵转为对称矩阵
-            adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
+            if self.training:
+                adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
             #adj = self.normalize(adj + sp.eye(adj.shape[0]))
             adj = self.normalize(adj)
         else:
             adj = sp.coo_matrix((np.ones(len(row)), (row, col)),
-                                shape=(self.num_cats + self.num_PA, self.num_items), dtype=np.float32)
+                                shape=(self.num_cats + self.num_PA, self.num_items_col), dtype=np.float32)
             # adj = self.normalize(adj + sp.eye(adj.shape[0]))
             adj = self.normalize(adj)
         adj = self.sparse_mx_to_torch_sparse_tensor(adj)
         return adj
-
-    def generate_flow_char_adj_from_coo_row_col(self, row, col):
-
-        adj = sp.coo_matrix((np.ones(len(row)), (row, col)), shape=(self.num_cats+ self.num_PA, 2 * self.num_items), dtype=np.float32)
-        #adj = self.normalize(adj + sp.eye(adj.shape[0]))
-        adj = self.normalize(adj)
-        adj = self.sparse_mx_to_torch_sparse_tensor(adj)
-
-        self.flow_char_adj = adj
     
     def normalize(self, mx):
         """Row-normalize sparse matrix"""
@@ -307,5 +337,6 @@ class GraphManager(BaseGraphManager):
         indices = torch.from_numpy(np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
         values = torch.from_numpy(sparse_mx.data)
         shape = torch.Size(sparse_mx.shape)
+
         return torch.sparse.FloatTensor(indices, values, shape)
     

@@ -22,6 +22,8 @@ class Anomaly_Detector(object):
         self.cm = cm
         self.model_name = flags_obj.model
         self.num_items = flags_obj.num_items
+        self.num_cats = flags_obj.num_cats
+        self.num_PA = flags_obj.num_PA
         self.feature_size = flags_obj.feature_size
         self.embedding_size = flags_obj.embedding_size
         self.datafile_prefix = flags_obj.datafile_prefix
@@ -73,8 +75,6 @@ class BaseIEADDetector(Anomaly_Detector):
     def __init__(self, flags_obj, workspace, cm):
         super(BaseIEADDetector, self).__init__(flags_obj, workspace, cm)
         self.weight_decay = flags_obj.weight_decay
-        self.num_cats = flags_obj.num_cats
-        self.num_PA = flags_obj.num_PA
         self.set_gm(flags_obj)
         self.generate_transfer_feature_adj(flags_obj)
 
@@ -108,29 +108,34 @@ class BaseIEADDetector(Anomaly_Detector):
         return optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay, betas=(0.5, 0.99))
 
     def inference(self, sample):
-        item_id, cat_r, cat_n, PA_level = sample
-        item_id = item_id.to(self.device)
-        cat_r = cat_r.to(self.device)
-        cat_n = cat_n.to(self.device)
-        PA_level = PA_level.to(self.device) + self.num_cats
-        p_score, n_score = self.model(self.gm.feature, self.gm.flow_adj, self.gm.flow_char_adj, item_id, cat_r, cat_n, PA_level)
 
-        return p_score, n_score
+        item_id, cat, PA_level = sample
+        item_id = item_id.to(self.device)
+        cat_r = cat.to(self.device)
+        PA_level = PA_level.to(self.device) + self.num_cats
+        a_p_score, a_n_score, n_p_score, n_n_score = self.model(self.gm.feature, self.gm.flow_adj, self.gm.flow_char_adj, item_id, cat_r, PA_level)
+
+        return a_p_score, a_n_score, n_p_score, n_n_score
 
     def prepare_test(self):
         self.flow_emb, self.character_emb = self.model.test_encode(self.gm.feature, self.gm.flow_char_adj)
 
-    def test_inference(self, sample):
+    def test_inference(self, sample, test_flow_adj):
         items, cats, PA_level, features = sample
         items = torch.squeeze(items.to(self.device))
         cats = torch.squeeze(cats.to(self.device))
         PA_level = torch.squeeze(PA_level.to(self.device)) + self.num_cats
+        features = features.to(self.device)
 
-        cats_a = torch.ones_like(cats)
-        cats_n = torch.zeros_like(cats)
-        scores = self.model.test_decode(self.flow_emb, self.character_emb, items, cats, PA_level)
+        scores_a, scores_n = self.model.test_decode(self.flow_emb, self.character_emb, items, PA_level, features, test_flow_adj)
+        #pred = torch.sigmoid(scores_a -scores_n)
+        score = torch.cat([scores_n.reshape(-1,1), scores_a.reshape(-1,1)], dim=1)
+        pred = torch.squeeze(score.argmax(dim=1))
+        scores = scores_a - scores_n
 
-        return scores, cats
+
+
+        return scores_a, scores_n, cats, scores
 
 
 class IEADDetector(BaseIEADDetector):
@@ -142,7 +147,7 @@ class IEADDetector(BaseIEADDetector):
         self.gm = utils.GraphManager(flags_obj)
 
     def set_pup_model(self):
-        self.model = model.IEAD(self.feature_size, self.embedding_size, self.dropout)
+        self.model = model.IEAD(self.feature_size, self.embedding_size, self.num_cats, self.dropout)
 
     def get_dataloader_generator(self):
-        return data.PriceLevelFactorizationDataLoaderGenerator(self.datafile_prefix)
+        return data.PriceLevelPairwiseDataLoaderGenerator(self.datafile_prefix)

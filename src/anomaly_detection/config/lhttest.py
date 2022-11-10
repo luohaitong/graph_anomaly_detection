@@ -2,6 +2,6 @@ import numpy as np
 import scipy.sparse as sp
 
 
-lht = {0:1, 2:5}
-lht = list(lht.values())
-print(lht)
+lht = [2,5,8,6]
+lht = np.sort(lht)
+print(lht[-2])

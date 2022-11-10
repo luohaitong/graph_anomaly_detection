@@ -5,14 +5,15 @@
 #pylint: disable=import-error
 
 import math
+import time
 
+import numpy
 import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
 import torch.nn.functional as F
 import numpy as np
 import scipy.sparse as sp
-import gc
 
 
 class MF(nn.Module):
@@ -157,7 +158,7 @@ class GraphAttentionLayer(nn.Module):
 
         #self.W = nn.Parameter(torch.zeros(size=(in_features, out_features)))
         #nn.init.xavier_uniform_(self.W.data, gain=1.414)
-        self.a = nn.Parameter(torch.zeros(size=(2*feature_size, 1)))
+        self.a = nn.Parameter(torch.zeros(size=(feature_size, 1)))
         nn.init.xavier_uniform_(self.a.data, gain=1.414)
 
 
@@ -169,83 +170,104 @@ class GraphAttentionLayer(nn.Module):
         '''
         #h = torch.mm(input, self.W) # shape [N, embedding_size]
         #N = x.size()[0]
-        N = adj.size()[0]
+        #N = adj.size()[0]
+
+        #邻接矩阵按行归一化
+        #e = torch.norm(x, dim=1)
+
+        e = torch.matmul(x, self.a).squeeze(1)
+        col = adj._indices()[1]
+        values = e[col]
+
+        adj_new = torch.sparse.FloatTensor(adj._indices(), values, adj.shape)
+
+        attention = torch.sparse.softmax(adj_new, dim=1)
+
+        #此处的attention为权重值
+        h_prime = torch.sparse.mm(attention, x)  # [batch_size,N], [N, embedding_size] --> [batch_size, embedding_size]
+
         '''
-        a_input = torch.cat([x.repeat(1, N).view(N * N, -1), x.repeat(N, 1)], dim=1).view(N, -1, 2 * self.out_features) # shape[N, N, 2*embedding_size]
+        batch_size = adj.size()[0]
+        item_num = adj.size()[1]
+        x1 = x.repeat(1, batch_size).view(batch_size * item_num, -1)
+        x2 = x.repeat(batch_size, 1)
+        print(x1.shape)
+        print(x2.shape)
+        a_input = torch.cat([x1, x2], dim=1).view(batch_size, -1, 2 * self.feature_size) # shape[N, N, 2*embedding_size]
         #e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(2))  # [N,N,1] -> [N,N]
         e = torch.matmul(a_input, self.a).squeeze(2)  # [N,N,1] -> [N,N]
-        '''
-        '''
-        e = torch.norm(x, dim=1)
-        print(adj.size())
-        print(e.size())
         zero_vec = -9e15*torch.ones_like(e)
-        adj = F.softmax(adj, dim=1)
         attention = torch.where(adj > 0, e, zero_vec)
-        attention = F.softmax(attention, dim=1)
-        '''
-        attention = adj
         #此处的attention为权重值
-        h_prime = torch.spmm(attention, x)  # [N,N], [N, embedding_size] --> [N, embedding_size]
+        h_prime = torch.sparse.mm(attention, x)  # [batch_size,N], [N, embedding_size] --> [batch_size, embedding_size]
+        '''
 
         return h_prime
+
+    def normalize(self, mx):
+        """Row-normalize sparse matrix"""
+
+        rowsum = np.array(mx.sum(1))
+        r_inv = np.power(rowsum, -1).flatten()
+        r_inv[np.isinf(r_inv)] = 0.
+        r_mat_inv = sp.diags(r_inv)
+        mx = r_mat_inv.dot(mx)
+
+        '''
+        print(mx.shape)
+        print("processing")
+        mx = F.softmax(mx, dim=1)
+        print(mx.shape)
+        '''
+        return mx
+
+    def sparse_mx_to_torch_sparse_tensor(self, sparse_mx):
+        """Convert a scipy sparse matrix to a torch sparse tensor."""
+        sparse_mx = sparse_mx.tocoo().astype(np.float32)
+        indices = torch.from_numpy(np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
+        values = torch.from_numpy(sparse_mx.data)
+        shape = torch.Size(sparse_mx.shape)
 
 class flow_GraphAttention(nn.Module):
     def __init__(self, feature_size, dropout):
         super(flow_GraphAttention, self).__init__()
         self.dropout = dropout
-        self.feature_size = feature_size
-        self.aggregator = Flow_Aggregator(feature_size)
-        self.linear1 = nn.Linear(2 * self.feature_size, self.feature_size)  #
+        self.attentions = GraphAttentionLayer(feature_size)
+        self.weight = Parameter(torch.FloatTensor(2*feature_size, feature_size))
+        self.reset_parameters()
 
-    def forward(self, item_id, features, history_list, new_features = None, training = True):
+    def reset_parameters(self):
+        stdv = 1. / math.sqrt(self.weight.size(1))
+        self.weight.data.uniform_(-stdv, stdv)
 
-        tmp_history = []
-        for item in item_id:
-            tmp_history.append(history_list[int(item)])
+    def forward(self, item_id, x, flow_adj, training, test_x = None):
 
+        if len(item_id) < flow_adj.shape[0]:
+            new_row = []
+            new_col = []
+            for i in range(len(item_id)):
+                col_tmp = flow_adj[item_id[i]]._indices()[0]
+                new_col.extend(col_tmp)
+                new_row.extend(torch.full(col_tmp.shape, i))
+            new_col = torch.tensor(new_col)
+            new_row = torch.tensor(new_row)
+            indices = torch.vstack((new_row, new_col))
+            values = torch.ones_like(new_row)
+            shape = torch.Size([len(item_id), flow_adj.shape[1]])
+            flow_adj_tmp = torch.sparse.FloatTensor(indices, values, shape).to(flow_adj.device)
+
+
+
+        x_agg = self.attentions(x, flow_adj_tmp)
         if training:
-            self_feats = features[item_id]
+            x = torch.cat([x[item_id], x_agg], dim=1)
         else:
-            self_feats = new_features
+            x = torch.cat([test_x, x_agg], dim=1)
+        x = torch.mm(x, self.weight)
+        x = torch.tanh(x)
+        x = F.dropout(x, self.dropout, training=training)
 
-        neigh_feats = self.aggregator.forward(features, tmp_history, self_feats)  # user-item network
-
-        # self-connection could be considered.
-
-        combined = torch.cat([self_feats, neigh_feats], dim=1)
-        combined = F.relu(self.linear1(combined))
-        combined = F.dropout(combined, self.dropout, training=training)
-
-        return combined
-
-class Flow_Aggregator(nn.Module):
-    """
-    flow aggregator: for aggregating embeddings of neighbors (flow aggreagator).
-    """
-    def __init__(self, feature_size):
-        super(Flow_Aggregator, self).__init__()
-        self.att = Attention(feature_size)
-
-    def forward(self, flow_latent, history_list, self_flow_latent):
-
-        for i in range(len(history_list)):
-            history_tmp = history_list[i]
-            num_neigh = len(history_tmp)
-
-            flow_latent_tmp = self_flow_latent[i]
-
-            flow_latent_neigh = flow_latent[history_tmp]
-
-            att_w = self.att(flow_latent_neigh, flow_latent_tmp, num_neigh)
-            att_history = torch.mm(flow_latent_neigh.t(), att_w)
-            att_history = att_history.t()
-
-            self_flow_latent[i] = att_history
-            gc.collect()
-            torch.cuda.empty_cache()
-
-        return self_flow_latent
+        return x
 
 class character_GraphConvolution(nn.Module):
 
@@ -262,10 +284,11 @@ class character_GraphConvolution(nn.Module):
 
 class IEAD(nn.Module):
 
-    def __init__(self, feature_size, embedding_size, dropout):
+    def __init__(self, feature_size, embedding_size, num_cats, dropout):
 
         super(IEAD, self).__init__()
         self.dropout = dropout
+        self.num_cats = num_cats
         self.weight_emb = Parameter(torch.FloatTensor(feature_size, embedding_size))
         self.bias_emb = Parameter(torch.FloatTensor(embedding_size))
         self.weight_character = Parameter(torch.FloatTensor(2*embedding_size, embedding_size))
@@ -282,16 +305,32 @@ class IEAD(nn.Module):
         self.weight_character.data.uniform_(-stdv, stdv)
 
     
-    def forward(self, feature, flow_adj, flow_char_adj, item_id, category_r, category_n, PA_level):
+    def forward(self, feature, flow_adj, flow_char_adj, item_id, category, PA_level):
+
+        item_id_a = item_id[:,0]
+        item_id_n = item_id[:,1]
+        category_a = category[:,0]
+        category_n = category[:,1]
+        PA_level_a = PA_level[:,0]
+        PA_level_n = PA_level[:,1]
 
         flow_emb, character_emb = self.embedding_encode(feature, flow_char_adj)
-        character_latent_r = self.character_modeling(character_emb, category_r, PA_level)
-        character_latent_n = self.character_modeling(character_emb, category_n, PA_level)
-        flow_latent = self.flow_modeling(item_id, flow_emb, character_emb, flow_adj, flow_char_adj)
-        pred_r = self.decode_score(flow_latent, character_latent_r)
-        pred_n = self.decode_score(flow_latent, character_latent_n)
+        flow_latent_a = self.flow_modeling(item_id_a, flow_emb, character_emb, flow_adj, flow_char_adj)
+        character_latent_aa = self.character_modeling(character_emb, category_a, PA_level_a)
+        #character_latent_n = self.character_modeling(character_emb, category_n, PA_level)
+        #flow_latent = flow_latent[item_id]
+        character_latent_na = self.character_modeling(character_emb, category_n, PA_level_a)
+        pred_a_p = self.decode_score(flow_latent_a, character_latent_aa)
+        pred_a_n = self.decode_score(flow_latent_a, character_latent_na)
+        #pred_n = self.decode_score(flow_latent, character_latent_n)
 
-        return pred_r, pred_n
+        flow_latent_n = self.flow_modeling(item_id_n, flow_emb, character_emb, flow_adj, flow_char_adj)
+        character_latent_nn = self.character_modeling(character_emb, category_n, PA_level_n)
+        character_latent_an = self.character_modeling(character_emb, category_a, PA_level_n)
+        pred_n_p = self.decode_score(flow_latent_n, character_latent_nn)
+        pred_n_n = self.decode_score(flow_latent_n, character_latent_an)
+
+        return pred_a_p, pred_a_n, pred_n_p, pred_n_n
 
     def embedding_encode(self, features, flow_char_adj):
 
@@ -307,28 +346,26 @@ class IEAD(nn.Module):
         character_emb = self.character_gc(flow_emb, flow_char_adj)
         return flow_emb, character_emb
 
-    def test_encode(self, feature, flow_char_adj):
-
-        flow_emb, character_emb = self.embedding_encode(feature, flow_char_adj)
-
-        return flow_emb, character_emb
-
     def character_modeling(self, character_emb, category, PA):
+
         category_embedding = character_emb[category]
+
         PA_embedding = character_emb[PA]
+
         character_emb = torch.cat([category_embedding, PA_embedding], dim=1)
+
         character_latent = torch.mm(character_emb, self.weight_character)
+
         character_latent = torch.sigmoid(character_latent)
 
         return character_latent
 
-    def flow_modeling(self, item_id, flow_emb, character_emb, flow_adj, flow_char_adj):
+    def flow_modeling(self, item_id, flow_emb, character_emb, flow_adj, flow_char_adj, training = True, test_flow_emb = None):
 
         #取item_id的adj
         '''
         support = sp.coo_matrix((np.ones(len(item_id)), (np.array(range(len(item_id))), item_id)),
                             shape=(len(item_id), flow_adj.size()[1]), dtype=np.float32)
-
         support = torch.sparse_coo_tensor(
             torch.tensor([np.array(range(len(item_id))), item_id]),
             torch.ones(len(item_id)),
@@ -337,17 +374,22 @@ class IEAD(nn.Module):
         flow_adj =
         flow_adj = torch.mm(support.t(), flow_adj)
         '''
-        flow_latent = self.attribute_agg(flow_emb, character_emb, flow_char_adj)
-        flow_latent = self.flow_gc(item_id, flow_latent, flow_adj, training=True)
+        if training:
+            flow_cat_adj = flow_char_adj.to_dense()
+            flow_cat_adj = flow_cat_adj[:self.num_cats].T  # node_size * category_num
+            flow_latent = self.attribute_agg(flow_emb, character_emb, flow_cat_adj)
+            flow_latent = self.flow_gc(item_id, flow_latent, flow_adj, training=True)
+        else:
+            test_flow_latent = self.attribute_agg(test_flow_emb, character_emb, flow_char_adj)
+            flow_latent = self.flow_gc(item_id, flow_emb, flow_adj, training=False, test_x = test_flow_latent)
 
         return flow_latent
 
-    def attribute_agg(self, flow_emb, character_emb, flow_char_adj):
+    def attribute_agg(self, flow_emb, character_emb, flow_cat_adj):
 
-        flow_char_adj = flow_char_adj.to_dense()
-        category_emb = character_emb[:2]   #category_num * emb_size
-        flow_cate_adj = (flow_char_adj[:2]).T   #node_size * category_num
-        flow_emb_agg = (flow_emb+ torch.spmm(flow_cate_adj, category_emb))/2  #node_size * emb_size
+        category_emb = character_emb[:self.num_cats]   #category_num * emb_size
+        tem = torch.mm(flow_cat_adj, category_emb)
+        flow_emb_agg = (flow_emb + tem)*0.5  #node_size * emb_size
 
         return flow_emb_agg
     
@@ -359,17 +401,57 @@ class IEAD(nn.Module):
         return pred_p, pred_n
     
     def decode_score(self, flow_latent, character_latent):
-        lht = torch.mul(character_latent, flow_latent)
-        scores = torch.sum(lht, dim=1)
+
+        #scores = torch.sum(torch.mul(character_latent, flow_latent), dim=1)
+        scores = torch.cosine_similarity(character_latent, flow_latent)
 
         return scores
-    
-    def test_decode(self, flow_emb, character_emb, items, cats, PA_level, flow_adj):
-        character_latent = self.character_modeling(character_emb, cats, PA_level)
-        flow_latent = self.flow_modeling(items, flow_emb, character_emb, flow_adj, flow_char_adj)
-        pred = self.decode_score(flow_latent, character_latent)
 
-        return pred
+    def test_encode(self, feature, flow_char_adj):
+
+        flow_emb, character_emb = self.embedding_encode(feature, flow_char_adj)
+        flow_cat_adj = flow_char_adj.to_dense()
+        flow_cat_adj = flow_cat_adj[:self.num_cats].T  # node_size * category_num
+        flow_latent = self.attribute_agg(flow_emb, character_emb, flow_cat_adj)
+
+        return flow_latent, character_emb
+
+    def test_decode(self, flow_emb, character_emb, item_id, PA_level, features, test_flow_adj):
+
+
+        test_flow_emb = torch.matmul(features, self.weight_emb)
+        test_flow_emb += self.bias_emb
+
+        cats_n = torch.zeros_like(PA_level)
+        #flow_cat_adj_n = torch.cat([torch.ones_like(PA_level, dtype=torch.float32).view(-1, 1),
+                                    #torch.zeros_like(PA_level, dtype=torch.float32).view(-1, 1)], dim=1)
+        flow_cat_adj_n = torch.zeros([PA_level.shape[0], self.num_cats], dtype=torch.float32)
+        flow_cat_adj_n[:,0] = 1
+        flow_cat_adj_n = flow_cat_adj_n.to(PA_level.device)
+        character_latent_n = self.character_modeling(character_emb, cats_n, PA_level)
+        flow_latent_n = self.flow_modeling(item_id, flow_emb, character_emb, test_flow_adj, flow_cat_adj_n,
+                                         training=False, test_flow_emb = test_flow_emb)
+        pred_n = self.decode_score(flow_latent_n, character_latent_n)
+
+        for i in range(1, self.num_cats):
+
+            cats_a = torch.full_like(PA_level, i)
+            flow_cat_adj_a = torch.zeros([PA_level.shape[0], self.num_cats], dtype=torch.float32)
+            flow_cat_adj_a[:,i] = 1
+            flow_cat_adj_a = flow_cat_adj_a.to(PA_level.device)
+            #flow_cat_adj_a = torch.cat([torch.zeros_like(PA_level, dtype=torch.float32).view(-1, 1), torch.ones_like(PA_level, dtype=torch.float32).view(-1, 1)], dim=1)
+            character_latent_a = self.character_modeling(character_emb, cats_a, PA_level)
+            flow_latent_a = self.flow_modeling(item_id, flow_emb, character_emb, test_flow_adj, flow_cat_adj_a,
+                                             training=False, test_flow_emb = test_flow_emb)
+            pred_a_tmp = self.decode_score(flow_latent_a, character_latent_a)
+            if i==1:
+                pred_a_all = pred_a_tmp.reshape(-1, 1)
+            else:
+                pred_a_all = torch.cat([pred_a_tmp.reshape(-1, 1), pred_a_all], dim=1)
+
+        pred_a = torch.max(pred_a_all, dim=1)[0]
+
+        return pred_a, pred_n
 
 class Attention(nn.Module):
     def __init__(self, embedding_dims):
@@ -383,7 +465,6 @@ class Attention(nn.Module):
         self.softmax = nn.Softmax(0)
 
     def forward(self, node1, u_rep, num_neighs):
-        gc.collect()
         torch.cuda.empty_cache()
         '''
         x = F.relu(self.att1(x))

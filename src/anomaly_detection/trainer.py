@@ -13,13 +13,16 @@ import recommender
 import numpy as np
 import torch
 import torch.optim as optim
+from tester import InstantTester, PostTester
 
 class Trainer(object):
 
-    def __init__(self, flags_obj, cm):
+    def __init__(self, flags_obj, cm, val):
 
         self.cm = cm
+        self.val = val
         #self.vm = vm
+        self.flags_obj = flags_obj
         self.name = flags_obj.name
         self.model = flags_obj.model
         self.dataset = flags_obj.dataset
@@ -48,6 +51,9 @@ class Trainer(object):
         for epoch in range(self.epochs):
 
             self.train_one_epoch(epoch)
+            if self.val:
+                self.set_tester()
+                self.tester.test()
             #self.recommender.save_ckpt(epoch)
             #self.scheduler.step()
     
@@ -58,6 +64,11 @@ class Trainer(object):
     def set_optimizer(self):
 
         self.optimizer = self.recommender.get_optimizer()
+
+    def set_tester(self):
+        #self.cm.set_test_logging()
+        #vm.show_test_info(flags_obj)
+        self.tester = InstantTester(self.flags_obj, self.recommender, self.cm)
     
     def set_scheduler(self):
 
@@ -69,36 +80,67 @@ class Trainer(object):
 
         running_loss = 0.0
         total_loss = 0.0
+        total_cross_loss = 0.0
+        total_triplet_loss = 0.0
         num_batch = len(data_loader)
         distances = np.zeros(num_batch)
-        p_score_mean = 0
-        n_score_mean = 0
+        a_p_score_mean = 0
+        a_n_score_mean = 0
+        n_p_score_mean = 0
+        n_n_score_mean = 0
         logging.info('learning rate : {}'.format(self.optimizer.param_groups[0]['lr']))
 
         for batch_count, sample in enumerate(tqdm(data_loader, ncols=50)):
             self.optimizer.zero_grad()
-            p_score, n_score = self.recommender.inference(sample)
+            a_p_score, a_n_score, n_p_score, n_n_score = self.recommender.inference(sample)
+            #distances[batch_count] = (p_score - n_score).mean().item()
+            pos_score = a_p_score + n_p_score
+            neg_score = a_n_score + n_n_score
 
-            distances[batch_count] = (p_score - n_score).mean().item()
-
-            loss = self.bpr_loss(p_score, n_score)
+            #loss = self.bpr_loss(a_p_score, a_n_score, n_p_score, n_n_score)
+            cross_loss = self.cross_entropy_loss(pos_score, neg_score)
+            triplet_loss = self.triplet_loss(pos_score, neg_score)
+            loss = cross_loss + triplet_loss
             loss.backward()
             self.optimizer.step()
 
+            total_cross_loss += cross_loss.item()
+            total_triplet_loss += triplet_loss.item()
             running_loss += loss.item()
             total_loss += loss.item()
-            p_score_mean += sum(p_score)
-            n_score_mean += sum(n_score)
+            a_p_score_mean += sum(a_p_score)
+            a_n_score_mean += sum(a_n_score)
+            n_p_score_mean += sum(n_p_score)
+            n_n_score_mean += sum(n_n_score)
 
             if batch_count % (num_batch // 5) == num_batch // 5 - 1:
                 logging.info('epoch {}: running loss = {}'.format(epoch, running_loss / (num_batch // 5)))
                 running_loss = 0.0
 
-        print('epoch {}: total loss = {}'.format(epoch, total_loss))
-        logging.info('epoch {}: total loss = {}'.format(epoch, total_loss))
+        print("a_p_score_mean:", a_p_score_mean/857899)
+        print("a_n_score_mean:", a_n_score_mean/857899)
+        print("n_p_score_mean:", n_p_score_mean/857899)
+        print("n_n_score_mean:", n_n_score_mean/857899)
+        print('epoch {}: average cross loss = {} ,average triplet loss = {}'.format(epoch, total_cross_loss / num_batch,
+                                                                                total_triplet_loss / num_batch))
+        print('epoch {}: average loss = {}'.format(epoch, total_loss/num_batch))
+        logging.info('epoch {}: total loss = {}'.format(epoch, total_loss/num_batch))
         #self.vm.update_line('loss', epoch, total_loss)
         #self.vm.update_line('distance', epoch, distances.mean())
-    
-    def bpr_loss(self, p_score, n_score):
 
-        return -torch.mean(torch.log(torch.sigmoid(n_score - p_score)))
+
+    def cross_entropy_loss(self, pos_score, neg_score):
+        out = torch.cat([torch.unsqueeze(pos_score, -1), torch.unsqueeze(neg_score, -1)], 1)
+
+        prob = torch.softmax(out, dim=1)
+        prob_p = prob[:,0]
+
+        return  -torch.mean(torch.log(prob_p))
+
+    def bpr_loss(self, a_p_score, a_n_score, n_p_score, n_n_score):
+
+        return -torch.mean(torch.log(torch.sigmoid(a_p_score- n_n_score + n_p_score- a_n_score)))
+
+    def triplet_loss(self, pos_score, neg_score):
+
+        return -torch.mean(pos_score - neg_score)

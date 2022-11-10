@@ -15,6 +15,7 @@ import torch
 import utils
 import recommender
 import metrics
+from sklearn.metrics import roc_auc_score,accuracy_score,recall_score,f1_score,precision_score
 
 
 class Tester(object):
@@ -25,11 +26,25 @@ class Tester(object):
         self.name = flags_obj.name
         self.model = flags_obj.model
         self.dataset = flags_obj.dataset
+        self.test_num_items = flags_obj.test_num_items
+        self.set_device(flags_obj)
         self.workspace = cm.workspace
         self.set_recommender(flags_obj, trained_recommender, cm.workspace)
         self.set_rm(flags_obj)
         self.set_dataloader()
-    
+        self.set_gm(flags_obj)
+        self.generate_transfer_feature_adj(flags_obj)
+
+    def set_device(self, flags_obj):
+        self.device = self.cm.set_device(flags_obj)
+
+    def set_gm(self, flags_obj):
+        self.gm = utils.GraphManager(flags_obj, training=False)
+
+    def generate_transfer_feature_adj(self, flags_obj):
+        self.gm.generate_feature_and_adj(flags_obj)
+        self.gm.transfer_data(self.device)
+
     def set_recommender(self, flags_obj, trained_recommender, workspace):
 
         pass
@@ -44,27 +59,87 @@ class Tester(object):
     
     def test(self):
 
-        hit_recall = np.zeros(len(self.rm.topk), dtype=np.float64)
-        hit_ndcg = np.zeros(len(self.rm.topk), dtype=np.float64)
+        #hit_recall = np.zeros(len(self.rm.topk), dtype=np.float64)
+        #hit_ndcg = np.zeros(len(self.rm.topk), dtype=np.float64)
+        pred = []
+        label = []
+        score2 = []
+        score_a_list = []
+        score_n_list = []
 
         with torch.no_grad():
 
-            self.recommender.prepare_test(self.rm.flow_adj)
+            self.recommender.prepare_test()
 
             for _, sample in enumerate(tqdm(self.dataloader)):
-                
-                scores, num_positive = self.recommender.test_inference(sample)
-                scores = scores.to(torch.device('cpu'))
+                scores_a, scores_n, labels, scores_2 = self.recommender.test_inference(sample, self.gm.flow_adj)
 
-                hit_recall_u, hit_ndcg_u = metrics.calc_hit_recall_ndcg(scores, num_positive.item(), self.rm.topk, True)
+                #scores = scores.to(torch.device('cpu'))
+                labels = labels.to(torch.device('cpu'))
+                scores_2 = scores_2.to(torch.device('cpu'))
 
-                hit_recall = hit_recall + hit_recall_u
-                hit_ndcg = hit_ndcg + hit_ndcg_u
+                #pred.extend(list(scores))
+                label.extend(list(labels))
+                score2.extend(list(scores_2))
+                score_a_list.extend(list(scores_a))
+                score_n_list.extend(list(scores_n))
+                #hit_recall_u, hit_ndcg_u = metrics.calc_hit_recall_ndcg(scores_2, labels, self.rm.topk, True)
 
-        recall = hit_recall / self.rm.num_users
-        ndcg = hit_ndcg / self.rm.num_users
+                #hit_recall = hit_recall + hit_recall_u
+                #hit_ndcg = hit_ndcg + hit_ndcg_u
 
-        self.report(recall, ndcg)
+        '''
+        print("sum label:", sum(label))
+        print("sum pred", sum(pred))
+        print("acc is:",accuracy_score(label, pred))
+        print("recall is:", recall_score(label, pred))
+        print("f1 is:", f1_score(label, pred))
+        print("precision is:",precision_score(label, pred))
+        '''
+        print("auc is:", roc_auc_score(label, score2))
+        label = np.array(label)
+        score_a_list = np.array(score_a_list)
+        score_n_list = np.array(score_n_list)
+        score2 = np.array(score2)
+        score_aa_list = score_a_list[label == 1]
+        score_an_list = score_a_list[label == 0]
+        score_na_list = score_n_list[label == 1]
+        score_nn_list = score_n_list[label == 0]
+        score_a_list = score2[label == 1]
+        score_n_list = score2[label == 0]
+
+
+
+        print("score_a_list:", sum(score_a_list) / len(score_a_list))
+        print("score_n_list:", sum(score_n_list) / len(score_n_list))
+        print("score_aa_list:",sum(score_aa_list) / len(score_aa_list))
+        print("score_an_list:", sum(score_an_list) / len(score_an_list))
+        print("score_na_list:", sum(score_na_list) / len(score_na_list))
+        print("score_nn_list:", sum(score_nn_list) / len(score_nn_list))
+        for k in self.rm.topk:
+            topk_score = np.sort(score2)[-k]
+            print("topk_score:", topk_score)
+            score_tem = np.array(score2)
+            a_index = score_tem >= topk_score
+            n_index = score_tem < topk_score
+            score_tem[a_index] = 1
+            score_tem[n_index] = 0
+            print("k is:", k)
+            print("acc is:",accuracy_score(label, score_tem))
+            print("recall is:", recall_score(label, score_tem))
+            print("f1 is:", f1_score(label, score_tem))
+            print("precision is:",precision_score(label, score_tem))
+        '''
+        dict = {}
+        dict['score_a_list'] = score_a_list.tolist()
+        dict['score_n_list'] = score_n_list.tolist()
+        with open('test_score.json', 'w') as f:
+            f.write(json.dumps(dict))
+        '''
+        #recall = hit_recall / self.rm.num_users
+        #ndcg = hit_ndcg / self.rm.num_users
+
+        #self.report(recall, ndcg)
     
     def report(self, recall, ndcg):
 
